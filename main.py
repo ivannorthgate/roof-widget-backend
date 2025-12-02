@@ -8,7 +8,7 @@ from typing import Any, Dict
 
 app = FastAPI()
 
-# Allow your GHL page to call this API
+# ✅ CORS FIX: allow your exact funnel domain(s)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -16,7 +16,7 @@ app.add_middleware(
         "https://northgate-construction.com",
         "https://www.northgate-construction.com"
     ],
-    allow_credentials=False,   # IMPORTANT: must be False if you don't need cookies
+    allow_credentials=False,  # IMPORTANT for wildcard/CORS safety
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -28,13 +28,18 @@ class MeasureRequest(BaseModel):
 
 USER_AGENT = "YourRoofWidget/1.0 (contact: youremail@yourdomain.com)"
 
+
+# ---------------------------
+# FREE ADDRESS -> LAT/LNG (Photon)
+# ---------------------------
 def photon_autocomplete(query):
     url = f"https://photon.komoot.io/api/?q={query}&limit=1"
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
     r.raise_for_status()
     data = r.json()
-    if not data["features"]:
+    if not data.get("features"):
         return None
+
     props = data["features"][0]["properties"]
     coords = data["features"][0]["geometry"]["coordinates"]
     return {
@@ -43,6 +48,10 @@ def photon_autocomplete(query):
         "lng": coords[0]
     }
 
+
+# ---------------------------
+# GET BUILDING OUTLINE (Overpass / OSM)
+# ---------------------------
 def overpass_building_polygon(lat, lng):
     query = f"""
     [out:json];
@@ -52,6 +61,7 @@ def overpass_building_polygon(lat, lng):
     );
     out geom;
     """
+
     r = requests.post(
         "https://overpass-api.de/api/interpreter",
         data=query.encode("utf-8"),
@@ -73,12 +83,16 @@ def overpass_building_polygon(lat, lng):
     if not candidates:
         return None
 
+    # choose biggest polygon (usually main roof)
     def area_of(poly_points):
         return Polygon(poly_points).area
 
-    best = max(candidates, key=area_of)
-    return best
+    return max(candidates, key=area_of)
 
+
+# ---------------------------
+# POLYGON AREA -> SQFT
+# ---------------------------
 def polygon_area_sqft(poly_points):
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
     meter_points = [transformer.transform(lon, lat) for lon, lat in poly_points]
@@ -86,25 +100,36 @@ def polygon_area_sqft(poly_points):
     area_sqft = poly_m.area * 10.7639
     return area_sqft
 
+
+# ---------------------------
+# /measure-roof  (MVP AREA ONLY)
+# ---------------------------
 @app.post("/measure-roof")
 def measure_roof(req: MeasureRequest):
     lat, lng = req.lat, req.lng
 
+    # If lat/lng missing, try Photon search (free)
     if lat is None or lng is None:
         if not req.address:
             return {"error": "no_location"}
+
         geo = photon_autocomplete(req.address)
         if not geo:
             return {"error": "geocode_failed"}
+
         lat, lng = geo["lat"], geo["lng"]
 
+    # Get roof footprint from OpenStreetMap
     poly_points = overpass_building_polygon(lat, lng)
     if not poly_points:
         return {"error": "no_footprint"}
 
     flat_sqft = polygon_area_sqft(poly_points)
 
+    # MVP pitch default
     pitch_class = "medium"
+
+    # rough slope multiplier
     multipliers = {"low": 1.05, "medium": 1.15, "steep": 1.25}
     roof_sqft = flat_sqft * multipliers[pitch_class]
     squares = roof_sqft / 100
@@ -116,41 +141,70 @@ def measure_roof(req: MeasureRequest):
         "pitch_class": pitch_class
     }
 
+
+# ---------------------------
+# /create-lead  (BULLETPROOF)
+# ---------------------------
 @app.post("/create-lead")
 async def create_lead(request: Request):
-    req: Dict[str, Any] = await request.json()
-
-    name = req.get("name", "")
-    email = req.get("email", "")
-    phone = req.get("phone", "")
-    address = req.get("address", "")
-    pitch_class = req.get("pitch_class", "unknown")
-    ghl_webhook_url = req.get("ghl_webhook_url")
-
-    squares_raw = req.get("squares", 0)
     try:
-        squares_val = float(squares_raw)
-    except:
-        squares_val = 0
+        req: Dict[str, Any] = await request.json()
 
-    if not ghl_webhook_url:
-        return {"status": "error", "message": "Missing ghl_webhook_url from widget", "received_payload": req}
+        first_name = (req.get("first_name") or "").strip()
+        last_name = (req.get("last_name") or "").strip()
 
-    payload = {
-        "name": name,
-        "email": email,
-        "phone": phone,
-        "address": address,
-        "squares": squares_val,
-        "pitch_class": pitch_class,
-        "source": "Roof Widget"
-    }
+        name = (req.get("name") or "").strip()
+        if not name:
+            name = f"{first_name} {last_name}".strip()
 
-    r = requests.post(ghl_webhook_url, json=payload, timeout=10)
+        email = req.get("email") or ""
+        phone = req.get("phone") or ""
+        address = req.get("address") or ""
+        pitch_class = req.get("pitch_class") or "unknown"
+        ghl_webhook_url = req.get("ghl_webhook_url") or ""
 
-    return {
-        "status": "sent",
-        "ghl_status": r.status_code,
-        "ghl_body": r.text,
-        "received_payload": req
-    }
+        squares_raw = req.get("squares", 0)
+        try:
+            squares_val = float(squares_raw)
+        except:
+            squares_val = 0
+
+        if not ghl_webhook_url:
+            return {
+                "status": "error",
+                "message": "Missing ghl_webhook_url from widget",
+                "received_payload": req
+            }
+
+        payload = {
+            "first_name": first_name,
+            "last_name": last_name,
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "address": address,
+            "squares": squares_val,
+            "pitch_class": pitch_class,
+            "source": "Roof Widget"
+        }
+
+        try:
+            r = requests.post(ghl_webhook_url, json=payload, timeout=15)
+            return {
+                "status": "sent",
+                "ghl_status": r.status_code,
+                "ghl_body": r.text,
+                "received_payload": req
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "message": f"Failed to send to GHL: {str(e)}",
+                "received_payload": req
+            }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Server error in create-lead: {str(e)}"
+        }
