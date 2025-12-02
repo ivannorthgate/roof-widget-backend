@@ -11,8 +11,12 @@ app = FastAPI()
 # Allow your GHL page to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "https://affiliate.northgate-construction.com",
+        "https://northgate-construction.com",
+        "https://www.northgate-construction.com"
+    ],
+    allow_credentials=False,   # IMPORTANT: must be False if you don't need cookies
     allow_methods=["*"],
     allow_headers=["*"],
 )
