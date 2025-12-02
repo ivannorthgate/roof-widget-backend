@@ -1,16 +1,17 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 from shapely.geometry import Polygon
 from pyproj import Transformer
+from typing import Any, Dict
 
 app = FastAPI()
 
 # Allow your GHL page to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later you can restrict to your domain
+    allow_origins=["*"],  # you can lock to your domain later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -20,55 +21,6 @@ class MeasureRequest(BaseModel):
     address: str = ""
     lat: float = None
     lng: float = None
-
-from typing import Optional, Union
-
-from typing import Any, Dict
-from fastapi import Request
-
-@app.post("/create-lead")
-async def create_lead(request: Request):
-    req: Dict[str, Any] = await request.json()
-
-    # Pull fields safely (won’t crash if missing)
-    name = req.get("name", "")
-    email = req.get("email", "")
-    phone = req.get("phone", "")
-    address = req.get("address", "")
-    pitch_class = req.get("pitch_class", "unknown")
-    ghl_webhook_url = req.get("ghl_webhook_url")
-
-    # Squares might be number or text
-    squares_raw = req.get("squares", 0)
-    try:
-        squares_val = float(squares_raw)
-    except:
-        squares_val = 0
-
-    # If webhook URL is missing, return a clear error
-    if not ghl_webhook_url:
-        return {"status": "error", "message": "Missing ghl_webhook_url from widget"}
-
-    payload = {
-        "name": name,
-        "email": email,
-        "phone": phone,
-        "address": address,
-        "squares": squares_val,
-        "pitch_class": pitch_class,
-        "source": "Roof Widget"
-    }
-
-    r = requests.post(ghl_webhook_url, json=payload, timeout=10)
-
-    return {
-        "status": "sent",
-        "ghl_status": r.status_code,
-        "ghl_body": r.text,
-        "received_payload": req  # helps debug if needed
-    }
-
-
 
 USER_AGENT = "YourRoofWidget/1.0 (contact: youremail@yourdomain.com)"
 
@@ -88,7 +40,6 @@ def photon_autocomplete(query):
     }
 
 def overpass_building_polygon(lat, lng):
-    # Finds nearest building polygon within ~25 meters
     query = f"""
     [out:json];
     (
@@ -97,10 +48,12 @@ def overpass_building_polygon(lat, lng):
     );
     out geom;
     """
-    r = requests.post("https://overpass-api.de/api/interpreter",
-                      data=query.encode("utf-8"),
-                      headers={"User-Agent": USER_AGENT},
-                      timeout=30)
+    r = requests.post(
+        "https://overpass-api.de/api/interpreter",
+        data=query.encode("utf-8"),
+        headers={"User-Agent": USER_AGENT},
+        timeout=30
+    )
     r.raise_for_status()
     data = r.json()
 
@@ -116,30 +69,23 @@ def overpass_building_polygon(lat, lng):
     if not candidates:
         return None
 
-    # Pick the biggest polygon (usually the main roof, not a shed)
     def area_of(poly_points):
-        poly = Polygon(poly_points)
-        return poly.area
+        return Polygon(poly_points).area
 
     best = max(candidates, key=area_of)
     return best
 
 def polygon_area_sqft(poly_points):
-    """
-    poly_points are (lon, lat). Convert to meters, compute area, then to sqft.
-    """
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
     meter_points = [transformer.transform(lon, lat) for lon, lat in poly_points]
     poly_m = Polygon(meter_points)
-    area_sqm = poly_m.area
-    area_sqft = area_sqm * 10.7639
+    area_sqft = poly_m.area * 10.7639
     return area_sqft
 
 @app.post("/measure-roof")
 def measure_roof(req: MeasureRequest):
     lat, lng = req.lat, req.lng
 
-    # If lat/lng missing, try Photon search (free)
     if lat is None or lng is None:
         if not req.address:
             return {"error": "no_location"}
@@ -148,18 +94,13 @@ def measure_roof(req: MeasureRequest):
             return {"error": "geocode_failed"}
         lat, lng = geo["lat"], geo["lng"]
 
-    # Get roof footprint from OpenStreetMap
     poly_points = overpass_building_polygon(lat, lng)
     if not poly_points:
         return {"error": "no_footprint"}
 
     flat_sqft = polygon_area_sqft(poly_points)
 
-    # MVP: no LiDAR pitch yet -> ask user / default medium
     pitch_class = "medium"
-
-    # Convert flat to rough roof area using simple multiplier per pitch class
-    # low ~ 1.05, medium ~ 1.15, steep ~ 1.25
     multipliers = {"low": 1.05, "medium": 1.15, "steep": 1.25}
     roof_sqft = flat_sqft * multipliers[pitch_class]
     squares = roof_sqft / 100
@@ -172,24 +113,40 @@ def measure_roof(req: MeasureRequest):
     }
 
 @app.post("/create-lead")
-def create_lead(req: LeadRequest):
-    # Convert squares to float if possible
+async def create_lead(request: Request):
+    req: Dict[str, Any] = await request.json()
+
+    name = req.get("name", "")
+    email = req.get("email", "")
+    phone = req.get("phone", "")
+    address = req.get("address", "")
+    pitch_class = req.get("pitch_class", "unknown")
+    ghl_webhook_url = req.get("ghl_webhook_url")
+
+    squares_raw = req.get("squares", 0)
     try:
-        squares_val = float(req.squares)
+        squares_val = float(squares_raw)
     except:
         squares_val = 0
 
+    if not ghl_webhook_url:
+        return {"status": "error", "message": "Missing ghl_webhook_url from widget", "received_payload": req}
+
     payload = {
-        "name": req.name,
-        "email": req.email or "",
-        "phone": req.phone or "",
-        "address": req.address or "",
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "address": address,
         "squares": squares_val,
-        "pitch_class": req.pitch_class,
+        "pitch_class": pitch_class,
         "source": "Roof Widget"
     }
 
-    r = requests.post(req.ghl_webhook_url, json=payload, timeout=10)
-    return {"status": "sent", "ghl_status": r.status_code, "ghl_body": r.text}
+    r = requests.post(ghl_webhook_url, json=payload, timeout=10)
 
-
+    return {
+        "status": "sent",
+        "ghl_status": r.status_code,
+        "ghl_body": r.text,
+        "received_payload": req
+    }
