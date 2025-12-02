@@ -11,7 +11,7 @@ app = FastAPI()
 # Allow your GHL page to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can lock to your domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
