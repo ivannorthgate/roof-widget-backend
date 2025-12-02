@@ -21,14 +21,17 @@ class MeasureRequest(BaseModel):
     lat: float = None
     lng: float = None
 
+from typing import Optional, Union
+
 class LeadRequest(BaseModel):
     name: str
-    email: str
-    phone: str
-    address: str
-    squares: float
-    pitch_class: str
+    email: Optional[str] = ""
+    phone: Optional[str] = ""
+    address: str = ""
+    squares: Union[float, str] = 0
+    pitch_class: str = "unknown"
     ghl_webhook_url: str
+
 
 USER_AGENT = "YourRoofWidget/1.0 (contact: youremail@yourdomain.com)"
 
@@ -133,15 +136,23 @@ def measure_roof(req: MeasureRequest):
 
 @app.post("/create-lead")
 def create_lead(req: LeadRequest):
+    # Convert squares to float if possible
+    try:
+        squares_val = float(req.squares)
+    except:
+        squares_val = 0
+
     payload = {
         "name": req.name,
-        "email": req.email,
-        "phone": req.phone,
-        "address": req.address,
-        "squares": req.squares,
+        "email": req.email or "",
+        "phone": req.phone or "",
+        "address": req.address or "",
+        "squares": squares_val,
         "pitch_class": req.pitch_class,
         "source": "Roof Widget"
     }
 
     r = requests.post(req.ghl_webhook_url, json=payload, timeout=10)
-    return {"status": "sent", "ghl_status": r.status_code}
+    return {"status": "sent", "ghl_status": r.status_code, "ghl_body": r.text}
+
+
