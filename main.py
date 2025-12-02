@@ -23,14 +23,51 @@ class MeasureRequest(BaseModel):
 
 from typing import Optional, Union
 
-class LeadRequest(BaseModel):
-    name: str
-    email: Optional[str] = ""
-    phone: Optional[str] = ""
-    address: str = ""
-    squares: Union[float, str] = 0
-    pitch_class: str = "unknown"
-    ghl_webhook_url: str
+from typing import Any, Dict
+from fastapi import Request
+
+@app.post("/create-lead")
+async def create_lead(request: Request):
+    req: Dict[str, Any] = await request.json()
+
+    # Pull fields safely (won’t crash if missing)
+    name = req.get("name", "")
+    email = req.get("email", "")
+    phone = req.get("phone", "")
+    address = req.get("address", "")
+    pitch_class = req.get("pitch_class", "unknown")
+    ghl_webhook_url = req.get("ghl_webhook_url")
+
+    # Squares might be number or text
+    squares_raw = req.get("squares", 0)
+    try:
+        squares_val = float(squares_raw)
+    except:
+        squares_val = 0
+
+    # If webhook URL is missing, return a clear error
+    if not ghl_webhook_url:
+        return {"status": "error", "message": "Missing ghl_webhook_url from widget"}
+
+    payload = {
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "address": address,
+        "squares": squares_val,
+        "pitch_class": pitch_class,
+        "source": "Roof Widget"
+    }
+
+    r = requests.post(ghl_webhook_url, json=payload, timeout=10)
+
+    return {
+        "status": "sent",
+        "ghl_status": r.status_code,
+        "ghl_body": r.text,
+        "received_payload": req  # helps debug if needed
+    }
+
 
 
 USER_AGENT = "YourRoofWidget/1.0 (contact: youremail@yourdomain.com)"
