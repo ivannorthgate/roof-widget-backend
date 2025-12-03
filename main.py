@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import requests
 from shapely.geometry import Polygon
 from pyproj import Transformer
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 app = FastAPI()
 
@@ -16,7 +16,7 @@ app.add_middleware(
         "https://northgate-construction.com",
         "https://www.northgate-construction.com"
     ],
-    allow_credentials=False,  # IMPORTANT: you're not using cookies here
+    allow_credentials=False,  # IMPORTANT: no cookies here
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -26,8 +26,8 @@ app.add_middleware(
 # ---------------------------
 class MeasureRequest(BaseModel):
     address: str = ""
-    lat: float = None
-    lng: float = None
+    lat: Optional[float] = None
+    lng: Optional[float] = None
 
 
 USER_AGENT = "YourRoofWidget/1.0 (contact: youremail@yourdomain.com)"
@@ -36,11 +36,12 @@ USER_AGENT = "YourRoofWidget/1.0 (contact: youremail@yourdomain.com)"
 # ---------------------------
 # FREE ADDRESS -> LAT/LNG (Photon)
 # ---------------------------
-def photon_autocomplete(query):
+def photon_autocomplete(query: str):
     url = f"https://photon.komoot.io/api/?q={query}&limit=1"
     r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
     r.raise_for_status()
     data = r.json()
+
     if not data.get("features"):
         return None
 
@@ -55,43 +56,65 @@ def photon_autocomplete(query):
 
 # ---------------------------
 # GET BUILDING OUTLINE (Overpass / OSM)
+# Upgrades:
+# 1) Radius 50m (instead of 25m)
+# 2) Fallback servers if one is down/busy
 # ---------------------------
-def overpass_building_polygon(lat, lng):
+def overpass_building_polygon(lat: float, lng: float):
+    servers = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.nchc.org.tw/api/interpreter"
+    ]
+
+    # ✅ Increased search radius to 50m
     query = f"""
     [out:json];
     (
-      way["building"](around:25,{lat},{lng});
-      relation["building"](around:25,{lat},{lng});
+      way["building"](around:50,{lat},{lng});
+      relation["building"](around:50,{lat},{lng});
     );
     out geom;
     """
 
-    r = requests.post(
-        "https://overpass-api.de/api/interpreter",
-        data=query.encode("utf-8"),
-        headers={"User-Agent": USER_AGENT},
-        timeout=30
-    )
-    r.raise_for_status()
-    data = r.json()
+    last_error = None
 
-    candidates = []
-    for el in data.get("elements", []):
-        geom = el.get("geometry")
-        if not geom:
+    for url in servers:
+        try:
+            r = requests.post(
+                url,
+                data=query.encode("utf-8"),
+                headers={"User-Agent": USER_AGENT},
+                timeout=35
+            )
+            r.raise_for_status()
+            data = r.json()
+
+            candidates = []
+            for el in data.get("elements", []):
+                geom = el.get("geometry")
+                if not geom:
+                    continue
+
+                points = [(p["lon"], p["lat"]) for p in geom]
+                if len(points) >= 3:
+                    candidates.append(points)
+
+            if not candidates:
+                continue
+
+            # choose biggest polygon (usually main roof)
+            def area_of(poly_points):
+                return Polygon(poly_points).area
+
+            return max(candidates, key=area_of)
+
+        except Exception as e:
+            last_error = e
             continue
-        points = [(p["lon"], p["lat"]) for p in geom]
-        if len(points) >= 3:
-            candidates.append(points)
 
-    if not candidates:
-        return None
-
-    # choose biggest polygon (usually main roof)
-    def area_of(poly_points):
-        return Polygon(poly_points).area
-
-    return max(candidates, key=area_of)
+    print("Overpass failed:", last_error)
+    return None
 
 
 # ---------------------------
@@ -101,8 +124,7 @@ def polygon_area_sqft(poly_points):
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
     meter_points = [transformer.transform(lon, lat) for lon, lat in poly_points]
     poly_m = Polygon(meter_points)
-    area_sqft = poly_m.area * 10.7639
-    return area_sqft
+    return poly_m.area * 10.7639
 
 
 # ---------------------------
@@ -123,7 +145,7 @@ def measure_roof(req: MeasureRequest):
 
         lat, lng = geo["lat"], geo["lng"]
 
-    # Get roof footprint from OpenStreetMap
+    # Get roof footprint from OpenStreetMap (with fallback servers)
     poly_points = overpass_building_polygon(lat, lng)
     if not poly_points:
         return {"error": "no_footprint"}
@@ -174,12 +196,17 @@ async def create_lead(request: Request):
         postal_code = req.get("postal_code") or ""
         country = req.get("country") or "US"
 
-        # Squares might be number or text
         squares_raw = req.get("squares", 0)
         try:
             squares_val = float(squares_raw)
         except:
             squares_val = 0
+
+        # Pricing / package fields (optional)
+        selected_package = req.get("selected_package") or ""
+        selected_product = req.get("selected_product") or ""
+        price_per_sq = req.get("price_per_sq") or 0
+        estimated_package_price = req.get("estimated_package_price") or 0
 
         if not ghl_webhook_url:
             return {
@@ -196,7 +223,6 @@ async def create_lead(request: Request):
             "phone": phone,
             "address": address,
 
-            # ✅ NEW fields for GHL
             "street": street,
             "city": city,
             "state": state,
@@ -205,6 +231,13 @@ async def create_lead(request: Request):
 
             "squares": squares_val,
             "pitch_class": pitch_class,
+
+            # ✅ Pricing selection (if they choose)
+            "selected_package": selected_package,
+            "selected_product": selected_product,
+            "price_per_sq": price_per_sq,
+            "estimated_package_price": estimated_package_price,
+
             "source": "Roof Widget"
         }
 
